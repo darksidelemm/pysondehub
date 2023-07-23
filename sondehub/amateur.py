@@ -405,6 +405,13 @@ class Uploader(object):
             # Process everything in the queue.
             _to_upload = []
 
+            # _temp_time = datetime.datetime.now(datetime.timezone.utc)
+            # _temp_time2 = time.time()
+            # _temp_ages = [(_temp_time - parse(x['data']['time_received'])).total_seconds() for x in self.upload_queue]
+            # _temp_uploads = [(_temp_time2 - x['upload_time']) for x in self.upload_queue]
+            # print(_temp_ages)
+            # print(_temp_uploads)
+
             # Pull out data from right side of queue, up to max elements
             for _ in range(len(self.upload_queue)):
 
