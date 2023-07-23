@@ -88,7 +88,9 @@ class Uploader(object):
         upload_retries=5,
         developer_mode=False,
         max_queue_size=10000,
-        packets_per_upload=30
+        packets_per_upload=30,
+        upload_backoff=10,
+        upload_backoff_max=60
     ):
         """ Initialise and start a Sondehub (Amateur) uploader
         
@@ -115,6 +117,8 @@ class Uploader(object):
         self.developer_mode = developer_mode
         self.packets_per_upload = packets_per_upload
         self.max_queue_size = max_queue_size
+        self.upload_backoff = upload_backoff
+        self.upload_backoff_max = upload_backoff_max
 
         # User information
         self.uploader_callsign = str(uploader_callsign)
@@ -347,7 +351,7 @@ class Uploader(object):
 
         # Finally, add the data to the queue if we are running.
         if self.input_processing_running:
-            self.upload_queue.append(output)
+            self.add_to_queue(output)
         else:
             self.log_debug("Processing not running, discarding.")
 
@@ -367,10 +371,29 @@ class Uploader(object):
 
         # Add it to the queue if we are running.
         if self.input_processing_running:
-            self.upload_queue.put(telemetry)
+            self.add_to_queue(telemetry)
         else:
             self.log_debug("Processing not running, discarding.")
 
+
+    def add_to_queue(self, telemetry, delay=0):
+        self.upload_queue.append({'data':telemetry, 'upload_time': time.time()+delay, 'delay': delay})
+        return True
+
+    def add_to_queue_left(self, telemetry, upload_time=None, delay=0):
+        if len(self.upload_queue) < self.upload_queue.maxlen:
+            # Cap the delay time
+            _delay = min(delay, self.upload_backoff_max)
+
+            # Calculate the upload time if we havent been provided one
+            if upload_time is None:
+                upload_time = time.time() + _delay
+
+            # Add onto the left of the queue
+            self.upload_queue.appendleft({'data':telemetry, 'upload_time': upload_time, 'delay': _delay})
+            return True
+        else:
+            return False
 
     def process_queue(self):
         """ Process data from the input queue, and write telemetry to log files.
@@ -383,9 +406,17 @@ class Uploader(object):
             _to_upload = []
 
             # Pull out data from right side of queue, up to max elements
-            while len(self.upload_queue) > 0:
+            for _ in range(len(self.upload_queue)):
 
-                _to_upload.append(self.upload_queue.pop())
+                _temp = self.upload_queue.pop()
+
+                if time.time() > _temp['upload_time']:
+                    # We can proceed to try and upload this packet now
+                    _to_upload.append(_temp)
+                else:
+                    # Not time yet. Add back onto left of queue with no modification to upload time or delay
+                    self.add_to_queue_left(_temp['data'], _temp['upload_time'], _temp['delay'])
+                    
 
                 if len(_to_upload) == self.packets_per_upload:
                     break
@@ -394,17 +425,20 @@ class Uploader(object):
             # If we have data to upload, attempt to upload it
             if len(_to_upload) > 0:
 
-                upload_success = self.upload_telemetry(_to_upload)
+                # Extract just the data itself.
+                _packets_to_upload = [pkt['data'] for pkt in _to_upload]
+
+                # Attempt to upload
+                upload_success = self.upload_telemetry(_packets_to_upload)
 
                 if not upload_success:
                     # Unable to upload, or we need to retry for some other reason.
-                    # Add the packets back to the left of the queue
+                    # Add the packets back to the left of the queue with a backoff
                     _discarded_packets = 0
                     for _packet in _to_upload:
-                        if len(self.upload_queue) < self.upload_queue.maxlen:
-                            self.upload_queue.appendleft(_packet)
-                        else:
-                            _discarded_packets += 1
+                        # Add back into the queue with an increased delay time
+                        if self.add_to_queue_left(_packet['data'], delay=_packet['delay']+self.upload_backoff) == False:
+                            _discarded_packets += 1 
                     
                     if _discarded_packets > 0:
                         self.log_warning(f"Discarded {_discarded_packets} packet(s) due to queue being full.")
@@ -518,7 +552,7 @@ class Uploader(object):
             return True
 
 
-        # Catch-al; is just discard the data
+        # Catch-all is just discard the data
         return True
 
 
