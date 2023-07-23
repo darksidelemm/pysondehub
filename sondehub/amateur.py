@@ -22,6 +22,7 @@ from threading import Thread
 from email.utils import formatdate
 from queue import Queue
 from dateutil.parser import parse
+from collections import deque
     
 
 def fix_datetime(datetime_str, local_dt_str=None):
@@ -85,7 +86,9 @@ class Uploader(object):
         upload_rate=2,
         upload_timeout=20,
         upload_retries=5,
-        developer_mode=False
+        developer_mode=False,
+        max_queue_size=10000,
+        packets_per_upload=30
     ):
         """ Initialise and start a Sondehub (Amateur) uploader
         
@@ -102,12 +105,16 @@ class Uploader(object):
             upload_timeout (int): Upload timeout (seconds)
             upload_retries (int): Upload retries
             developer_mode (bool): If set to true, packets will be discarded when they enter the Sondehub DB.
+            max_queue_size (int): Maximum number of packets to store in the queue.
+            packets_per_upload (int): Maximum number of packets to upload at a time.
         """
 
         self.upload_rate = upload_rate
         self.upload_timeout = upload_timeout
         self.upload_retries = upload_retries
         self.developer_mode = developer_mode
+        self.packets_per_upload = packets_per_upload
+        self.max_queue_size = max_queue_size
 
         # User information
         self.uploader_callsign = str(uploader_callsign)
@@ -135,8 +142,13 @@ class Uploader(object):
 
         self.software_combined_name = f"{self.software_name}-{self.software_version}"
 
-        # Input Queue.
-        self.input_queue = Queue()
+
+        # Upload Deque
+        # New packets are added onto the right of the queue.
+        # Packets that have failed to upload are added to the left of the queue.
+        self.upload_queue = deque(maxlen=max_queue_size)
+
+        self.upload_session = requests.Session()
 
         # Start processing the input queue.
         self.input_processing_running = True
@@ -335,10 +347,9 @@ class Uploader(object):
 
         # Finally, add the data to the queue if we are running.
         if self.input_processing_running:
-            self.input_queue.put(output)
+            self.upload_queue.append(output)
         else:
             self.log_debug("Processing not running, discarding.")
-
 
         return
 
@@ -356,7 +367,7 @@ class Uploader(object):
 
         # Add it to the queue if we are running.
         if self.input_processing_running:
-            self.input_queue.put(telemetry)
+            self.upload_queue.put(telemetry)
         else:
             self.log_debug("Processing not running, discarding.")
 
@@ -371,28 +382,59 @@ class Uploader(object):
             # Process everything in the queue.
             _to_upload = []
 
-            while self.input_queue.qsize() > 0:
-                try:
-                    _to_upload.append(self.input_queue.get_nowait())
-                except Exception as e:
-                    self.log_error("Error grabbing telemetry from queue - %s" % str(e))
+            # Pull out data from right side of queue, up to max elements
+            while len(self.upload_queue) > 0:
 
-            # Upload data!
-            if len(_to_upload) > 0:
-                self.upload_telemetry(_to_upload)
+                _to_upload.append(self.upload_queue.pop())
 
-
-            # Sleep while waiting for some new data.
-            for i in range(int(self.upload_rate)):
-                time.sleep(1)
-                if self.input_processing_running == False:
+                if len(_to_upload) == self.packets_per_upload:
                     break
+
+
+            # If we have data to upload, attempt to upload it
+            if len(_to_upload) > 0:
+
+                upload_success = self.upload_telemetry(_to_upload)
+
+                if not upload_success:
+                    # Unable to upload, or we need to retry for some other reason.
+                    # Add the packets back to the left of the queue
+                    _discarded_packets = 0
+                    for _packet in _to_upload:
+                        if len(self.upload_queue) < self.upload_queue.maxlen:
+                            self.upload_queue.appendleft(_packet)
+                        else:
+                            _discarded_packets += 1
+                    
+                    if _discarded_packets > 0:
+                        self.log_warning(f"Discarded {_discarded_packets} packet(s) due to queue being full.")
+                    
+                    self.log_debug(f"Upload failed, added {len(_to_upload)} packets back into queue ({len(self.upload_queue)}).")
+
+                else:
+                    self.log_debug(f"{len(self.upload_queue)} packets in upload queue.")
+
+                time.sleep(1)
+
+            else:
+                # No data to upload, wait a second and look again.
+                time.sleep(1)
+
+            if self.input_processing_running == False:
+                break
+
 
         self.log_info("Stopped Sondehub Amateur Uploader Thread.")
 
 
     def upload_telemetry(self, telem_list):
-        """ Upload an list of telemetry data to Sondehub """
+        """ 
+        Upload an list of telemetry data to Sondehub 
+        
+        This function has the following return values:
+        False = Packets should be added to the back of the deque for upload again later
+        True = Packets have either been uploaded or discarded, and do not need to be added to the queue.
+        """
 
         _data_len = len(telem_list)
 
@@ -406,7 +448,8 @@ class Uploader(object):
                 "Error serialising and compressing telemetry list for upload - %s"
                 % str(e)
             )
-            return
+            # Something wrong with the data, so just discard it.
+            return True
 
         _compression_time = time.time() - _start_time
         self.log_debug(
@@ -424,55 +467,59 @@ class Uploader(object):
 
         _start_time = time.time()
 
-        while _retries < self.upload_retries:
-            # Run the request.
-            try:
-                headers = {
-                    "User-Agent": "pysondehub-" + sondehub.__version__,
-                    "Content-Encoding": "gzip",
-                    "Content-Type": "application/json",
-                    "Date": formatdate(timeval=None, localtime=False, usegmt=True),
-                }
-                logging.debug(f"Sondehub Amateur Uploader - Upload Headers: {str(headers)}")
-                _req = requests.put(
-                    self.SONDEHUB_AMATEUR_URL,
-                    _compressed_payload,
-                    # TODO: Revisit this second timeout value.
-                    timeout=(self.upload_timeout, 6.1),
-                    headers=headers,
-                )
-            except Exception as e:
-                self.log_error("Upload Failed: %s" % str(e))
-                return
+        # Run the request.
+        try:
+            headers = {
+                "User-Agent": "pysondehub-" + sondehub.__version__,
+                "Content-Encoding": "gzip",
+                "Content-Type": "application/json",
+                "Date": formatdate(timeval=None, localtime=False, usegmt=True),
+            }
+            #self.log_debug(f"Upload Headers: {str(headers)}")
+            _req = self.upload_session.put(
+                self.SONDEHUB_AMATEUR_URL,
+                _compressed_payload,
+                # TODO: Revisit this second timeout value.
+                timeout=(self.upload_timeout, 6.1),
+                headers=headers,
+            )
+        except Exception as e:
+            self.log_error("Upload Failed: %s" % str(e))
+            # If we get an exception here, it means we can't connect to SondeHub
+            # or we got a timeout. So, re-try upload.
+            return False
 
-            if _req.status_code == 200:
-                # 200 is the only status code that we accept.
-                _upload_time = time.time() - _start_time
-                self.log_info(
-                    "Uploaded %d telemetry packets to Sondehub Amateur in %.1f seconds."
-                    % (_data_len, _upload_time)
-                )
-                _upload_success = True
-                break
+        if _req.status_code == 200:
+            # 200 is the only status code that we accept.
+            _upload_time = time.time() - _start_time
+            self.log_info(
+                "Uploaded %d telemetry packets to Sondehub Amateur in %.1f seconds."
+                % (_data_len, _upload_time)
+            )
+            # Successful upload, no need to re-add to deque
+            return True
 
-            elif _req.status_code == 500:
-                # Server Error, Retry.
-                self.log_debug(
-                    "Error uploading to Sondehub Amateur. Status Code: %d %s."
-                    % (_req.status_code, _req.text)
-                )
-                _retries += 1
-                continue
+        elif _req.status_code == 500:
+            # Server Error, Retry.
+            self.log_debug(
+                "Error uploading to Sondehub Amateur. Status Code: %d %s."
+                % (_req.status_code, _req.text)
+            )
+            # Retry upload
+            return False
 
-            else:
-                self.log_error(
-                    "Error uploading to Sondehub Amateur. Status Code: %d %s."
-                    % (_req.status_code, _req.text)
-                )
-                break
+        else:
+            self.log_error(
+                "Error uploading to Sondehub Amateur. Status Code: %d %s."
+                % (_req.status_code, _req.text)
+            )
 
-        if not _upload_success:
-            self.log_error("Upload failed after %d retries" % (_retries))
+            # Other upload issue, discard data.
+            return True
+
+
+        # Catch-al; is just discard the data
+        return True
 
 
     def upload_station_position(
@@ -520,7 +567,7 @@ class Uploader(object):
             "dev": self.developer_mode
         }
 
-        logging.debug(f"Sondehub Amateur Uploader - Generated Station Position Packet: {str(_position)}")
+        self.log_debug(f"Generated Station Position Packet: {str(_position)}")
 
         _retries = 0
         _upload_success = False
