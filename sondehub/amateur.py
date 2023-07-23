@@ -458,8 +458,8 @@ class Uploader(object):
                 time.sleep(1)
 
             else:
-                # No data to upload, wait a second and look again.
-                time.sleep(1)
+                # No data to upload, wait a little bit and look again.
+                time.sleep(0.1)
 
             if self.input_processing_running == False:
                 break
