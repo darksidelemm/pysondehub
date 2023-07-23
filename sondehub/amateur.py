@@ -400,24 +400,22 @@ class Uploader(object):
         """
         self.log_info("Started Sondehub Amateur Uploader Thread.")
 
+        # If we're getting reliable uploads, allow quick uploading of the queue
+        # If we get any upload errors, we start slowing down the uploads.
+        fast_upload = 0
+        fast_upload_threshold = 10
+
         while self.input_processing_running:
 
             # Process everything in the queue.
             _to_upload = []
-
-            # _temp_time = datetime.datetime.now(datetime.timezone.utc)
-            # _temp_time2 = time.time()
-            # _temp_ages = [(_temp_time - parse(x['data']['time_received'])).total_seconds() for x in self.upload_queue]
-            # _temp_uploads = [(_temp_time2 - x['upload_time']) for x in self.upload_queue]
-            # print(_temp_ages)
-            # print(_temp_uploads)
 
             # Pull out data from right side of queue, up to max elements
             for _ in range(len(self.upload_queue)):
 
                 _temp = self.upload_queue.pop()
 
-                if time.time() > _temp['upload_time']:
+                if (time.time() > _temp['upload_time']) or (fast_upload > fast_upload_threshold):
                     # We can proceed to try and upload this packet now
                     _to_upload.append(_temp)
                 else:
@@ -450,16 +448,18 @@ class Uploader(object):
                     if _discarded_packets > 0:
                         self.log_warning(f"Discarded {_discarded_packets} packet(s) due to queue being full.")
                     
-                    self.log_debug(f"Upload failed, added {len(_to_upload)} packets back into queue ({len(self.upload_queue)}).")
+                    self.log_warning(f"Upload failed, adding packets back into queue ({len(self.upload_queue)} packets in queue).")
+                    # Upload failed, switch back into 'slow' upload mode, then wait a bit before trying again.
+                    fast_upload = 0
+                    time.sleep(1)
 
                 else:
                     self.log_debug(f"{len(self.upload_queue)} packets in upload queue.")
-
-                time.sleep(1)
+                    fast_upload += 1
 
             else:
                 # No data to upload, wait a little bit and look again.
-                time.sleep(0.1)
+                time.sleep(1)
 
             if self.input_processing_running == False:
                 break
